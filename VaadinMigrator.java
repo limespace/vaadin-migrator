@@ -1,6 +1,10 @@
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.Charset;
+import java.nio.charset.CharsetEncoder;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -38,6 +42,9 @@ public final class VaadinMigrator {
     static final String TODO_PREFIX = "TODO [Vaadin-Migration]: ";
     static final Set<String> SKIP_DIRS = Set.of(".git", "target", "build", "node_modules", ".idea", ".gradle", ".settings");
     static String targetVersion = "25.3.0";
+    /** Erzwungene Eingabe-/Ausgabekodierung (null = automatisch erkennen bzw. beibehalten). */
+    static Charset forcedInput, forcedOutput;
+    static final Charset WINDOWS_1252 = Charset.isSupported("windows-1252") ? Charset.forName("windows-1252") : StandardCharsets.ISO_8859_1;
 
     // ------------------------------------------------------------------------------------------------
     // Typ-Zuordnungen:  alter FQN -> neuer FQN ("-" = entfällt) [ ; Hinweis für TODO ]
@@ -488,6 +495,7 @@ public final class VaadinMigrator {
     record FileReport(Path rel, boolean vaadin, List<String> todos) {}
 
     static final class AppShellInfo {
+        Text source = new Text("", StandardCharsets.UTF_8, false);
         Path dir;
         String pkg;
         boolean needed, push;
@@ -507,6 +515,8 @@ public final class VaadinMigrator {
         boolean dryRun = false;
         for (String a : args) {
             if (a.startsWith("--vaadin-version=")) targetVersion = a.substring("--vaadin-version=".length());
+            else if (a.startsWith("--encoding=")) forcedInput = charsetArg(a.substring("--encoding=".length()));
+            else if (a.startsWith("--output-encoding=")) forcedOutput = charsetArg(a.substring("--output-encoding=".length()));
             else if (a.equals("--dry-run")) dryRun = true;
             else if (a.equals("-h") || a.equals("--help")) { usage(); return; }
             else pos.add(a);
@@ -520,6 +530,16 @@ public final class VaadinMigrator {
         new VaadinMigrator(src, dst, dryRun).run();
     }
 
+    static Charset charsetArg(String name) {
+        try {
+            return Charset.forName(name);
+        } catch (RuntimeException e) {
+            System.err.println("Unbekannte Zeichenkodierung: " + name);
+            System.exit(2);
+            return null;
+        }
+    }
+
     static void usage() {
         System.out.println("""
             VaadinMigrator – Vaadin 7/8 -> Vaadin 25 (Flow)
@@ -530,6 +550,10 @@ public final class VaadinMigrator {
               <quelle>   Projektverzeichnis (wird nicht verändert) oder einzelne .java-Datei
               <ziel>     neues Verzeichnis bzw. Zieldatei
               --dry-run  nichts schreiben, nur Bericht auf der Konsole
+              --encoding=<zs>         Eingabekodierung erzwingen (Standard: automatisch
+                                      UTF-8 -> windows-1252 -> ISO-8859-1)
+              --output-encoding=<zs>  alle konvertierten Dateien in dieser Kodierung schreiben
+                                      (z.B. UTF-8; Standard: Kodierung der Quelldatei beibehalten)
             """);
     }
 
@@ -573,15 +597,10 @@ public final class VaadinMigrator {
         String name = in.getFileName().toString();
         if (name.endsWith(".java")) {
             javaFiles++;
-            Charset cs = StandardCharsets.UTF_8;
-            String text;
-            try {
-                text = Files.readString(in, cs);
-            } catch (CharacterCodingException e) {
-                cs = StandardCharsets.ISO_8859_1;
-                text = Files.readString(in, cs);
-            }
+            Text src = readText(in, rel);
+            String text = src.content();
             JavaFile jf = new JavaFile(rel, out);
+            jf.source = src;
             String result;
             try {
                 result = jf.convert(text);
@@ -591,23 +610,114 @@ public final class VaadinMigrator {
             }
             if (jf.vaadin) vaadinFiles++;
             reports.add(new FileReport(rel, jf.vaadin, todoLines(result)));
-            write(out, result, cs);
+            writeText(out, result, src, rel, true);
         } else if (name.equals("pom.xml")) {
-            String xml = Files.readString(in, StandardCharsets.UTF_8);
-            write(out, convertPom(xml, rel), StandardCharsets.UTF_8);
+            Text pom = readText(in, rel);
+            writeText(out, convertPom(pom.content(), rel), pom, rel, false);
         } else {
             if (name.endsWith(".gwt.xml")) globalNotes.add("`" + rel + "`: Widgetset-Definition wird in Flow nicht mehr benötigt – Datei löschen, Client-Add-ons durch Flow-Add-ons ersetzen.");
-            if (name.equals("web.xml") && Files.readString(in, StandardCharsets.ISO_8859_1).contains("com.vaadin"))
+            if (name.equals("web.xml") && new String(Files.readAllBytes(in), StandardCharsets.ISO_8859_1).contains("com.vaadin"))
                 globalNotes.add("`" + rel + "`: Vaadin-Servlet-Konfiguration prüfen – mit Spring Boot bzw. Servlet-3-Autoerkennung meist überflüssig, Namespace auf jakarta.ee umstellen.");
             if (name.equals("build.gradle") || name.equals("build.gradle.kts"))
                 globalNotes.add("`" + rel + "`: Gradle-Build wird nicht automatisch angepasst – Vaadin-Plugin `com.vaadin` " + targetVersion + ", Abhängigkeit `com.vaadin:vaadin`, Java 21 setzen.");
-            if (name.endsWith(".html") && Files.readString(in, StandardCharsets.ISO_8859_1).matches("(?s).*<v-[a-z-]+.*"))
+            if (name.endsWith(".html") && new String(Files.readAllBytes(in), StandardCharsets.ISO_8859_1).matches("(?s).*<v-[a-z-]+.*"))
                 globalNotes.add("`" + rel + "`: sieht nach einem Vaadin-8-Declarative-Design aus – muss in Java nachgebaut werden.");
             copied++;
             if (!dryRun) {
                 Files.createDirectories(out.getParent());
                 Files.copy(in, out, StandardCopyOption.REPLACE_EXISTING);
             }
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------------
+    // Zeichenkodierung
+    // ------------------------------------------------------------------------------------------------
+
+    /** Dateiinhalt mit erkannter Kodierung und BOM-Kennzeichen. */
+    record Text(String content, Charset charset, boolean bom) {}
+
+    final Map<String, Integer> charsetStats = new TreeMap<>();
+    final List<String> encodingNotes = new ArrayList<>();
+
+    /** Liest strikt: UTF-8 (BOM wird erkannt und entfernt), sonst windows-1252, sonst ISO-8859-1. */
+    Text readText(Path file, Path rel) throws IOException {
+        byte[] b = Files.readAllBytes(file);
+        boolean bom = b.length >= 3 && (b[0] & 0xFF) == 0xEF && (b[1] & 0xFF) == 0xBB && (b[2] & 0xFF) == 0xBF;
+        int off = bom ? 3 : 0;
+        List<Charset> candidates = forcedInput != null
+            ? List.of(forcedInput)
+            : bom ? List.of(StandardCharsets.UTF_8) : List.of(StandardCharsets.UTF_8, WINDOWS_1252, StandardCharsets.ISO_8859_1);
+        for (Charset cs : candidates) {
+            try {
+                String s = cs.newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .decode(ByteBuffer.wrap(b, off, b.length - off)).toString();
+                // Reines ASCII ist in jeder gängigen Kodierung gültig -> beim Schreiben ASCII bleiben,
+                // damit eingefügte Hinweise unabhängig von der Build-Kodierung (UTF-8/Cp1252/...) korrekt sind.
+                if (forcedInput == null && !bom && cs.equals(StandardCharsets.UTF_8) && isAscii(b)) cs = StandardCharsets.US_ASCII;
+                charsetStats.merge(cs.name(), 1, Integer::sum);
+                return new Text(s, cs, bom);
+            } catch (CharacterCodingException e) {
+                // nächste Kandidatin versuchen
+            }
+        }
+        Charset cs = candidates.get(0);
+        encodingNotes.add("`" + rel + "`: nicht gültig in " + cs.name() + " – ungültige Bytes wurden durch U+FFFD ersetzt. Datei prüfen!");
+        charsetStats.merge(cs.name() + " (fehlerhaft)", 1, Integer::sum);
+        return new Text(new String(b, off, b.length - off, cs), cs, bom);
+    }
+
+    static boolean isAscii(byte[] b) {
+        for (byte x : b) if (x < 0) return false;
+        return true;
+    }
+
+    /** Typografische Zeichen, die u.a. in eigenen TODO-Texten vorkommen, auf ASCII abbilden. */
+    static final Map<Character, String> TRANSLIT = Map.ofEntries(
+        entry('\u2013', "-"), entry('\u2014', "-"), entry('\u2192', "->"), entry('\u2190', "<-"),
+        entry('\u2026', "..."), entry('\u201E', "\""), entry('\u201C', "\""), entry('\u201D', "\""),
+        entry('\u201A', "'"), entry('\u2018', "'"), entry('\u2019', "'"), entry('\u00A0', " "),
+        entry('\u00E4', "ae"), entry('\u00F6', "oe"), entry('\u00FC', "ue"), entry('\u00C4', "Ae"),
+        entry('\u00D6', "Oe"), entry('\u00DC', "Ue"), entry('\u00DF', "ss"));
+
+    /**
+     * Schreibt so, dass nie eine UnmappableCharacterException entsteht: Zeichen, die die Zielkodierung nicht kennt,
+     * werden transliteriert; was dann noch übrig bleibt, wird in Java-Quellen als \\uXXXX, sonst als '?' geschrieben.
+     */
+    void writeText(Path out, String content, Text src, Path rel, boolean javaSource) throws IOException {
+        Charset target = forcedOutput != null ? forcedOutput : src.charset();
+        CharsetEncoder enc = target.newEncoder();
+        String text = content;
+        int escaped = 0;
+        if (!enc.canEncode(text)) {
+            StringBuilder sb = new StringBuilder(text.length() + 64);
+            for (int i = 0; i < text.length(); i++) {
+                char ch = text.charAt(i);
+                if (!Character.isSurrogate(ch) && enc.canEncode(ch)) { sb.append(ch); continue; }
+                String t = TRANSLIT.get(ch);
+                if (t != null && enc.canEncode(t)) { sb.append(t); continue; }
+                escaped++;
+                sb.append(javaSource ? String.format("\\u%04X", (int) ch) : "?");
+            }
+            text = sb.toString();
+        }
+        if (escaped > 0)
+            encodingNotes.add("`" + rel + "`: " + escaped + " Zeichen sind in " + target.name() + " nicht darstellbar und wurden "
+                + (javaSource ? "als \\uXXXX-Escape" : "als '?'") + " geschrieben.");
+        if (dryRun) return;
+        ByteBuffer bytes = target.newEncoder()
+            .onMalformedInput(CodingErrorAction.REPLACE)
+            .onUnmappableCharacter(CodingErrorAction.REPLACE)
+            .encode(CharBuffer.wrap(text));
+        byte[] data = new byte[bytes.remaining()];
+        bytes.get(data);
+        boolean bom = src.bom() && target.equals(StandardCharsets.UTF_8);
+        if (out.getParent() != null) Files.createDirectories(out.getParent());
+        try (var os = Files.newOutputStream(out)) {
+            if (bom) os.write(new byte[]{(byte) 0xEF, (byte) 0xBB, (byte) 0xBF});
+            os.write(data);
         }
     }
 
@@ -706,6 +816,15 @@ public final class VaadinMigrator {
         }
         p = p.replaceAll("(<artifactId>vaadin-maven-plugin</artifactId>\\s*<version>)(?!\\$\\{)[^<]*(</version>)", "$1" + targetVersion + "$2");
 
+        if (forcedOutput != null) {
+            before = p;
+            p = p.replaceAll("(<project\\.(?:build\\.sourceEncoding|reporting\\.outputEncoding)>)[^<]*(</project)", "$1" + forcedOutput.name() + "$2");
+            p = p.replaceAll("(<encoding>)[^<$]*(</encoding>)", "$1" + forcedOutput.name() + "$2");
+            if (!p.equals(before)) notes.add("Quellkodierung auf " + forcedOutput.name() + " gesetzt (--output-encoding).");
+        } else {
+            Matcher enc = Pattern.compile("<project\\.build\\.sourceEncoding>([^<]+)</").matcher(p);
+            if (!enc.find()) notes.add("`project.build.sourceEncoding` fehlt – ohne Angabe nimmt der Compiler die Plattformkodierung; UTF-8 setzen und Dateien mit --output-encoding=UTF-8 konvertieren.");
+        }
         if (p.contains("spring-boot-starter-parent") || p.contains("spring-boot-dependencies"))
             notes.add("Spring Boot: Vaadin 25 setzt Spring Boot 4 voraus – Version von spring-boot-starter-parent bzw. spring-boot-dependencies anheben.");
         if (p.contains("jetty-maven-plugin") || p.contains("jetty-ee"))
@@ -751,8 +870,8 @@ public final class VaadinMigrator {
         }
         body.append("public class ").append(cls).append(" implements AppShellConfigurator {\n}\n");
         Path out = appShell.dir.resolve(cls + ".java");
-        write(out, body.toString(), StandardCharsets.UTF_8);
         Path rel = singleFile ? out.getFileName() : dst.relativize(out);
+        writeText(out, body.toString(), appShell.source, rel, true);
         reports.add(new FileReport(rel, true, todoLines(body.toString())));
         globalNotes.add("`" + rel + "` wurde neu erzeugt (AppShellConfigurator mit @Push/Stylesheet).");
     }
@@ -769,6 +888,12 @@ public final class VaadinMigrator {
         r.append("| davon mit Vaadin-Bezug | ").append(vaadinFiles).append(" |\n");
         r.append("| TODO-Markierungen | ").append(todos).append(" |\n");
         r.append("| sonstige Dateien kopiert | ").append(copied).append(" |\n\n");
+        r.append("## Zeichenkodierung\n\n");
+        r.append("Erkannt: ").append(charsetStats.entrySet().stream().map(e -> e.getKey() + " (" + e.getValue() + ")")
+            .collect(Collectors.joining(", "))).append("  \n");
+        r.append("Geschrieben: ").append(forcedOutput != null ? forcedOutput.name() + " (erzwungen)" : "jeweils in der erkannten Kodierung").append("\n\n");
+        for (String n : encodingNotes) r.append("- ").append(n).append("\n");
+        if (!encodingNotes.isEmpty()) r.append("\n");
         if (!globalNotes.isEmpty()) {
             r.append("## Projektweite Hinweise\n\n");
             for (String n : globalNotes) r.append("- ").append(n).append("\n");
@@ -825,6 +950,7 @@ public final class VaadinMigrator {
         final List<String> staticImports = new ArrayList<>();
         final Set<TypeMapping> active = new LinkedHashSet<>();
         String className, superType, pkg, requestParam;
+        Text source;
         boolean vaadin, routeAdded, uiConverted;
 
         JavaFile(Path rel, Path out) { this.rel = rel; this.out = out; }
@@ -1273,6 +1399,7 @@ public final class VaadinMigrator {
             appShell.needed = true;
             if (appShell.dir == null) {
                 appShell.dir = out.getParent();
+                if (source != null) appShell.source = new Text("", source.charset(), source.bom());
                 appShell.pkg = pkg;
             }
             if (!appShell.sources.contains(rel.toString())) appShell.sources.add(rel.toString());
@@ -1486,7 +1613,7 @@ public final class VaadinMigrator {
                     Matcher tm = NOTIF_TYPE.matcher(a.get(a.size() - 1));
                     if (!tm.matches())
                         return todo("Notification.show: Typ nicht erkannt – Varianten per addThemeVariants(NotificationVariant...) setzen") + f;
-                    String text = a.size() >= 3 ? a.get(0) + " + " + lit("\" – \"") + " + " + a.get(1) : a.get(0);
+                    String text = a.size() >= 3 ? a.get(0) + " + " + lit("\" - \"") + " + " + a.get(1) : a.get(0);
                     String base = "Notification.show(" + text + ")";
                     return switch (tm.group(1)) {
                         case "ERROR_MESSAGE" -> base + ".addThemeVariants(" + use("NotificationVariant") + ".LUMO_ERROR)";
@@ -1499,8 +1626,8 @@ public final class VaadinMigrator {
                     if (a.size() < 2) return null;
                     int typeIdx = -1;
                     for (int i = 0; i < a.size(); i++) if (NOTIF_TYPE.matcher(a.get(i)).matches()) typeIdx = i;
-                    if (typeIdx < 0) return a.size() == 2 ? "new Notification(" + a.get(0) + " + " + lit("\" – \"") + " + " + a.get(1) + ")" : null;
-                    String text = typeIdx >= 2 ? a.get(0) + " + " + lit("\" – \"") + " + " + a.get(1) : a.get(0);
+                    if (typeIdx < 0) return a.size() == 2 ? "new Notification(" + a.get(0) + " + " + lit("\" - \"") + " + " + a.get(1) + ")" : null;
+                    String text = typeIdx >= 2 ? a.get(0) + " + " + lit("\" - \"") + " + " + a.get(1) : a.get(0);
                     Matcher tm = NOTIF_TYPE.matcher(a.get(typeIdx));
                     tm.matches();
                     String variant = switch (tm.group(1)) {
